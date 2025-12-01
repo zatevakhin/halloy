@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -209,12 +209,64 @@ pub fn view<'a>(
         None
     };
 
-    let count = old_messages.len() + new_messages.len();
-    let oldest = old_messages
+    let ordered_messages: Vec<(&'a data::Message, bool)> = old_messages
         .iter()
-        .chain(&new_messages)
-        .next()
-        .map_or_else(Utc::now, |message| message.server_time);
+        .map(|message| (*message, true))
+        .chain(new_messages.iter().map(|message| (*message, false)))
+        .collect();
+
+    let mut message_by_id: HashMap<&str, &'a data::Message> = HashMap::new();
+    let mut origin_map: HashMap<message::Hash, bool> = HashMap::new();
+    for (message, is_old) in &ordered_messages {
+        if let Some(id) = message.id.as_deref() {
+            message_by_id.insert(id, *message);
+        }
+        origin_map.insert(message.hash, *is_old);
+    }
+
+    let mut children: HashMap<message::Hash, Vec<&'a data::Message>> =
+        HashMap::new();
+    let mut has_parent: HashSet<message::Hash> = HashSet::new();
+
+    for (message, _) in &ordered_messages {
+        if let Some(parent_id) = message.reply_to.as_deref()
+            && let Some(parent) = message_by_id.get(parent_id)
+        {
+            children.entry(parent.hash).or_default().push(*message);
+            has_parent.insert(message.hash);
+        }
+    }
+
+    let mut roots: Vec<&'a data::Message> = Vec::new();
+    for (message, _) in ordered_messages {
+        if !has_parent.contains(&message.hash) {
+            roots.push(message);
+        }
+    }
+
+    fn collect_thread<'a>(
+        message: &'a data::Message,
+        depth: usize,
+        children: &HashMap<message::Hash, Vec<&'a data::Message>>,
+        flattened: &mut Vec<(&'a data::Message, usize)>,
+    ) {
+        flattened.push((message, depth));
+        if let Some(kids) = children.get(&message.hash) {
+            for child in kids {
+                collect_thread(child, depth + 1, children, flattened);
+            }
+        }
+    }
+
+    let mut flattened: Vec<(&'a data::Message, usize)> = Vec::new();
+    for root in roots {
+        collect_thread(root, 0, &children, &mut flattened);
+    }
+
+    let count = flattened.len();
+    let oldest = flattened
+        .first()
+        .map_or_else(Utc::now, |(message, _)| message.server_time);
     let status = state.status;
 
     let right_aligned_width = max_nick_chars.map(|max_nick_chars| {
@@ -240,259 +292,233 @@ pub fn view<'a>(
     let range_timestamp_excess_width = range_timestamp_extra_chars
         .map(|len| font::width_from_chars(len, &config.font));
 
-    let reply_lookup: HashMap<&str, &'a data::Message> = old_messages
-        .iter()
-        .chain(&new_messages)
-        .filter_map(|message| message.id.as_deref().map(|id| (id, *message)))
-        .collect();
+    let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    let mut last_date: Option<NaiveDate> = None;
+    let mut prev_message: Option<&data::Message> = None;
 
-    let message_rows = |last_date: Option<NaiveDate>,
-                        messages: &[&'a data::Message]| {
-        messages
-            .iter()
-            .scan(Option::<&data::Message>::None, |prev_message, message| {
-                let hide_nickname = if let HideConsecutive::Enabled(duration) =
-                    config.buffer.nickname.hide_consecutive
-                {
-                    !config.buffer.nickname.alignment.is_top()
-                            && matches!(message.target.source(), message::Source::User(_))
-                            && prev_message.is_some_and(|prev_message| {
-                                    matches!(
-                                        (message.target.source(), prev_message.target.source()),
-                                        (message::Source::User(user), message::Source::User(prev_user)) if user == prev_user
-                                    ) && duration.is_none_or(|duration| message.server_time - prev_message.server_time < duration)
-                                })
-                } else {
-                    false
-                };
+    let show_backlog_divider = !old_messages.is_empty()
+        && !new_messages.is_empty()
+        && (!config.buffer.backlog_separator.hide_when_all_read
+            || !new_messages.is_empty());
+    let mut divider_inserted = !show_backlog_divider;
 
-                *prev_message = Some(message);
-
-                Some(formatter
-                    .format(
-                        message,
-                        right_aligned_width,
-                        max_prefix_width,
-                        range_timestamp_excess_width,
-                        hide_nickname,
-                    )
-                    .map(|element| {
-                        let mut element = add_reply_indicator(
-                            message,
-                            element,
-                            message
-                                .reply_to
-                                .as_deref()
-                                .and_then(|id| reply_lookup.get(id).copied()),
-                            config,
-                            theme,
-                        );
-
-                        if reply_enabled
-                            && state.hovered_message == Some(message.hash)
-                        {
-                            if let Some(target) = ReplyTarget::from_message(message) {
-                                element = add_reply_button(element, target, theme);
-                            }
-                        }
-
-                        let element: Element<'a, Message> = mouse_area(element)
-                            .on_enter(Message::MessageHovered(message.hash))
-                            .on_exit(Message::MessageUnhovered(message.hash))
-                            .into();
-
-                        (message, keyed(keyed::Key::message(message), element))
-                    }))
-            })
-            .flatten()
-            .scan(last_date, |last_date, (message, element)| {
-                let date =
-                    message.server_time.with_timezone(&Local).date_naive();
-
-                let is_new_day = last_date.is_none_or(|prev| date > prev);
-
-                *last_date = Some(date);
-
-                let content = if let (
-                    message::Content::Fragments(fragments),
-                    Some(previews),
-                    true,
-                ) =
-                    (&message.content, previews, config.preview.enabled)
-                {
-                    let urls = fragments
-                        .iter()
-                        .filter_map(message::Fragment::url)
-                        .cloned()
-                        .collect::<Vec<_>>();
-
-                    if !urls.is_empty() {
-                        let is_message_visible = state
-                            .visible_url_messages
-                            .contains_key(&message.hash);
-
-                        let mut column = column![element];
-
-                        for (idx, url) in urls.iter().enumerate() {
-                            if message.hidden_urls.contains(url) {
-                                continue;
-                            }
-
-                            if let (
-                                true,
-                                Some(preview::State::Loaded(preview)),
-                            ) = (is_message_visible, previews.get(url))
-                            {
-                                let is_hovered =
-                                    state.hovered_preview.is_some_and(
-                                        |(a, b)| a == message.hash && b == idx,
-                                    );
-
-                                let is_visible_for_source =
-                                    if let Some(visible_for_source) = &visible_for_source {
-                                        visible_for_source(preview, message.target.source())
-                                    } else {
-                                        true
-                                    };
-
-                                if is_visible_for_source {
-                                    column = column.push(preview_row(
-                                        message,
-                                        preview,
-                                        url,
-                                        idx,
-                                        right_aligned_width,
-                                        max_prefix_width,
-                                        is_hovered,
-                                        config,
-                                        theme,
-                                    ));
-                                }
-                            }
-                        }
-
-                        if is_message_visible {
-                            notify_visibility(
-                                column,
-                                2000.0,
-                                notify_visibility::When::NotVisible,
-                                Message::ExitingViewport(message.hash),
-                            )
-                        } else {
-                            notify_visibility(
-                                column,
-                                1000.0,
-                                notify_visibility::When::Visible,
-                                Message::EnteringViewport(message.hash, urls),
-                            )
-                        }
-                    } else {
-                        element
-                    }
-                } else {
-                    element
-                };
-
-                if is_new_day && config.buffer.date_separators.show {
-                    Some(
-                        column![
-                            row![
-                                container(rule::horizontal(1))
-                                    .width(Length::Fill)
-                                    .padding(padding::right(6)),
-                                text(
-                                    date.and_time(
-                                        NaiveTime::from_hms_opt(0, 0, 0)
-                                            .expect("midnight is valid")
-                                    )
-                                    .and_local_timezone(Local)
-                                    .single()
-                                    .map_or(
-                                        // in the event of timezone weirdness,
-                                        // revert to default format
-                                        date.format(
-                                            &DateSeparators::default().format
-                                        ),
-                                        |datetime| {
-                                            datetime.format(
-                                                &config
-                                                    .buffer
-                                                    .date_separators
-                                                    .format,
-                                            )
-                                        }
-                                    )
-                                    .to_string()
-                                )
-                                .size(divider_font_size)
-                                .style(theme::text::secondary)
-                                .font_maybe(
-                                    theme::font_style::secondary(theme)
-                                        .map(font::get)
-                                ),
-                                container(rule::horizontal(1))
-                                    .width(Length::Fill)
-                                    .padding(padding::left(6))
-                            ]
-                            .padding(2)
-                            .align_y(iced::Alignment::Center),
-                            content
-                        ]
-                        .into(),
-                    )
-                } else {
-                    Some(content)
-                }
-            })
-            .collect::<Vec<_>>()
-    };
-
-    let old = message_rows(None, &old_messages);
-    let new = message_rows(
-        old_messages.last().map(|message| {
-            message.server_time.with_timezone(&Local).date_naive()
-        }),
-        &new_messages,
-    );
-
-    let show_backlog_divier = if old.is_empty() {
-        // If all newer messages in viewport, only show backlog divider at the top
-        // if we don't have any older messages at all (we're scrolled all the way up)
-        !has_more_older_messages
-    } else {
-        // Always show backlog divider after any visible older messages
-        if config.buffer.backlog_separator.hide_when_all_read {
-            !new_messages.is_empty()
+    for (message, depth) in flattened {
+        let hide_nickname = if let HideConsecutive::Enabled(duration) =
+            config.buffer.nickname.hide_consecutive
+        {
+            !config.buffer.nickname.alignment.is_top()
+                && matches!(message.target.source(), message::Source::User(_))
+                && prev_message.is_some_and(|prev_message| {
+                    matches!(
+                        (message.target.source(), prev_message.target.source()),
+                        (
+                            message::Source::User(user),
+                            message::Source::User(prev_user)
+                        ) if user == prev_user
+                    ) && duration.is_none_or(|duration| {
+                        message.server_time - prev_message.server_time
+                            < duration
+                    })
+                })
         } else {
-            true
+            false
+        };
+
+        prev_message = Some(message);
+
+        let Some(mut element) = formatter.format(
+            message,
+            right_aligned_width,
+            max_prefix_width,
+            range_timestamp_excess_width,
+            hide_nickname,
+        ) else {
+            continue;
+        };
+
+        if depth > 0 {
+            element = container(
+                row![
+                    text("↪")
+                        .size(theme::TEXT_SIZE - 2.0)
+                        .style(theme::text::secondary),
+                    element
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(padding::left(8.0 * depth as f32))
+            .into();
         }
-    };
 
-    let divider = if show_backlog_divier {
-        row![
-            container(rule::horizontal(1))
-                .width(Length::Fill)
-                .padding(padding::right(6)),
-            text("backlog")
-                .size(divider_font_size)
-                .style(theme::text::secondary)
-                .font_maybe(theme::font_style::secondary(theme).map(font::get)),
-            container(rule::horizontal(1))
-                .width(Length::Fill)
-                .padding(padding::left(6))
-        ]
-        .padding(2)
-        .align_y(iced::Alignment::Center)
-    } else {
-        row![]
-    };
+        if reply_enabled && state.hovered_message == Some(message.hash) {
+            if let Some(target) = ReplyTarget::from_message(message) {
+                element = add_reply_button(element, target, theme);
+            }
+        }
 
+        let element: Element<'a, Message> = mouse_area(element)
+            .on_enter(Message::MessageHovered(message.hash))
+            .on_exit(Message::MessageUnhovered(message.hash))
+            .into();
+
+        let element = keyed(keyed::Key::message(message), element);
+
+        let element = if let (
+            message::Content::Fragments(fragments),
+            Some(previews),
+            true,
+        ) =
+            (&message.content, previews, config.preview.enabled)
+        {
+            let urls = fragments
+                .iter()
+                .filter_map(message::Fragment::url)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if !urls.is_empty() {
+                let is_message_visible =
+                    state.visible_url_messages.contains_key(&message.hash);
+
+                let mut column = column![element];
+
+                for (idx, url) in urls.iter().enumerate() {
+                    if message.hidden_urls.contains(url) {
+                        continue;
+                    }
+
+                    if let (true, Some(preview::State::Loaded(preview))) =
+                        (is_message_visible, previews.get(url))
+                    {
+                        let is_hovered =
+                            state.hovered_preview.is_some_and(|(a, b)| {
+                                a == message.hash && b == idx
+                            });
+
+                        let is_visible_for_source =
+                            if let Some(visible_for_source) =
+                                &visible_for_source
+                            {
+                                visible_for_source(
+                                    preview,
+                                    message.target.source(),
+                                )
+                            } else {
+                                true
+                            };
+
+                        if is_visible_for_source {
+                            column = column.push(preview_row(
+                                message,
+                                preview,
+                                url,
+                                idx,
+                                right_aligned_width,
+                                max_prefix_width,
+                                is_hovered,
+                                config,
+                                theme,
+                            ));
+                        }
+                    }
+                }
+
+                if is_message_visible {
+                    notify_visibility(
+                        column,
+                        2000.0,
+                        notify_visibility::When::NotVisible,
+                        Message::ExitingViewport(message.hash),
+                    )
+                } else {
+                    notify_visibility(
+                        column,
+                        1000.0,
+                        notify_visibility::When::Visible,
+                        Message::EnteringViewport(message.hash, urls),
+                    )
+                }
+            } else {
+                element
+            }
+        } else {
+            element
+        };
+
+        let date = message.server_time.with_timezone(&Local).date_naive();
+        let is_new_day = last_date.is_none_or(|prev| date > prev);
+        last_date = Some(date);
+
+        let element = if is_new_day && config.buffer.date_separators.show {
+            column![
+                row![
+                    container(rule::horizontal(1))
+                        .width(Length::Fill)
+                        .padding(padding::right(6)),
+                    text(
+                        date.and_time(
+                            NaiveTime::from_hms_opt(0, 0, 0)
+                                .expect("midnight is valid")
+                        )
+                        .and_local_timezone(Local)
+                        .single()
+                        .map_or(
+                            date.format(&DateSeparators::default().format),
+                            |datetime| datetime
+                                .format(&config.buffer.date_separators.format)
+                        )
+                        .to_string()
+                    )
+                    .size(divider_font_size)
+                    .style(theme::text::secondary)
+                    .font_maybe(
+                        theme::font_style::secondary(theme).map(font::get)
+                    ),
+                    container(rule::horizontal(1))
+                        .width(Length::Fill)
+                        .padding(padding::left(6))
+                ]
+                .padding(2)
+                .align_y(iced::Alignment::Center),
+                element
+            ]
+            .into()
+        } else {
+            element
+        };
+
+        if show_backlog_divider
+            && !divider_inserted
+            && origin_map.get(&message.hash).is_some_and(|is_old| !*is_old)
+        {
+            let divider = row![
+                container(rule::horizontal(1))
+                    .width(Length::Fill)
+                    .padding(padding::right(6)),
+                text("backlog")
+                    .size(divider_font_size)
+                    .style(theme::text::secondary)
+                    .font_maybe(
+                        theme::font_style::secondary(theme).map(font::get)
+                    ),
+                container(rule::horizontal(1))
+                    .width(Length::Fill)
+                    .padding(padding::left(6))
+            ]
+            .padding(2)
+            .align_y(iced::Alignment::Center);
+
+            rows.push(keyed(keyed::Key::Divider, divider));
+            divider_inserted = true;
+        }
+
+        rows.push(element);
+    }
     let content = on_resize(
         column![
             top_row,
-            column(old).spacing(config.buffer.line_spacing),
-            keyed(keyed::Key::Divider, divider),
-            column(new).spacing(config.buffer.line_spacing),
+            column(rows).spacing(config.buffer.line_spacing),
             space::vertical().height(config.buffer.line_spacing),
         ]
         .spacing(config.buffer.line_spacing),
@@ -521,48 +547,6 @@ pub fn view<'a>(
     )
 }
 
-fn add_reply_indicator<'a>(
-    message: &data::Message,
-    element: Element<'a, Message>,
-    parent: Option<&'a data::Message>,
-    _config: &Config,
-    theme: &Theme,
-) -> Element<'a, Message> {
-    if message.reply_to.is_none() {
-        return element;
-    }
-
-    let (author, snippet) = parent
-        .map(|parent| {
-            (super::message_author(parent), super::reply_snippet(parent))
-        })
-        .unwrap_or((None, String::new()));
-
-    let text_value = if let Some(author) = author {
-        if snippet.is_empty() {
-            author
-        } else {
-            format!("{author}: {snippet}")
-        }
-    } else if !snippet.is_empty() {
-        snippet
-    } else {
-        String::from("Replying to an earlier message")
-    };
-
-    let indicator = row![
-        text("↪")
-            .size(theme::TEXT_SIZE - 2.0)
-            .style(theme::text::tertiary),
-        selectable_text(text_value)
-            .style(theme::selectable_text::tertiary)
-            .font_maybe(theme::font_style::tertiary(theme).map(font::get)),
-    ]
-    .spacing(6);
-
-    column![indicator, element].spacing(4).into()
-}
-
 fn add_reply_button<'a>(
     element: Element<'a, Message>,
     target: ReplyTarget,
@@ -574,7 +558,7 @@ fn add_reply_button<'a>(
             .style(theme::text::tertiary)
             .font_maybe(theme::font_style::tertiary(theme).map(font::get)),
     )
-    .padding([2, 6]);
+    .padding([0, 6]);
 
     let button = crate::widget::button::transparent_button(
         content,
