@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use futures::channel::mpsc;
 use futures::{Future, FutureExt};
 use indexmap::IndexMap;
-use irc::proto::{self, Command, command, tags};
+use irc::proto::{self, Command, command};
 use itertools::{Either, Itertools};
 use tokio::fs;
 
@@ -159,6 +159,7 @@ pub struct Client {
     supports_chathistory: bool,
     supports_bouncer_networks: bool,
     supports_detach: bool,
+    supports_message_tags: bool,
     sasl_succeeded: bool,
     chathistory_requests: HashMap<Target, ChatHistoryRequest>,
     chathistory_exhausted: HashMap<Target, bool>,
@@ -211,6 +212,7 @@ impl Client {
             supports_chathistory: false,
             supports_bouncer_networks: false,
             supports_detach: false,
+            supports_message_tags: false,
             sasl_succeeded: false,
             chathistory_requests: HashMap::new(),
             chathistory_exhausted: HashMap::new(),
@@ -379,7 +381,7 @@ impl Client {
                 self.labels.insert(label.clone(), context);
 
                 // IRC: Encode tags
-                message.tags = tags!["label" => label];
+                message.tags.insert("label".to_string(), label);
             }
 
             self.reroute_responses_to =
@@ -1052,6 +1054,9 @@ impl Client {
                 if caps.contains(&"labeled-response") {
                     self.supports_labels = true;
                 }
+                if caps.contains(&"message-tags") {
+                    self.supports_message_tags = true;
+                }
                 if caps.contains(&"away-notify") {
                     self.supports_away_notify = true;
                 }
@@ -1203,6 +1208,9 @@ impl Client {
                 }
                 if del_caps.contains(&"labeled-response") {
                     self.supports_labels = false;
+                }
+                if del_caps.contains(&"message-tags") {
+                    self.supports_message_tags = false;
                 }
                 if del_caps.contains(&"away-notify") {
                     self.supports_away_notify = false;
@@ -3649,6 +3657,11 @@ impl Map {
     pub fn get_server_supports_echoes(&self, server: &Server) -> bool {
         self.client(server)
             .is_some_and(|client| client.supports_echoes)
+    }
+
+    pub fn get_server_supports_message_tags(&self, server: &Server) -> bool {
+        self.client(server)
+            .is_some_and(|client| client.supports_message_tags)
     }
 
     pub fn get_server_chathistory_message_reference_types(

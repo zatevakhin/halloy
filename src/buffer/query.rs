@@ -86,6 +86,7 @@ pub fn view<'a>(
             history,
             previews,
             Option::<fn(&Preview, &message::Source) -> bool>::None,
+            clients.get_server_supports_message_tags(server),
             chathistory_state,
             config,
             theme,
@@ -210,6 +211,10 @@ impl Query {
                         hash,
                     ) => {
                         Some(Event::ContractCondensedMessage(server_time, hash))
+                    }
+                    scroll_view::Event::ReplyTo(target) => {
+                        self.input_view.start_reply(target);
+                        None
                     }
                 });
 

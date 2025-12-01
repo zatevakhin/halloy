@@ -113,6 +113,7 @@ impl Irc {
                                 target.to_string(),
                                 text.clone(),
                             )),
+                            None,
                         )
                     })
                     .collect(),
@@ -143,6 +144,7 @@ impl Irc {
                                 target.to_string(),
                                 text.clone(),
                             )),
+                            None,
                         )
                     })
                     .collect(),
@@ -167,6 +169,7 @@ impl Irc {
                     )
                     .0,
                     supports_echoes.then_some(self.clone()),
+                    None,
                 )])
             }
             _ => None,

@@ -21,7 +21,7 @@ use tokio::time;
 
 use self::correct_viewport::correct_viewport;
 use self::keyed::keyed;
-use super::context_menu;
+use super::{ReplyTarget, context_menu};
 use crate::widget::{
     Element, notify_visibility, on_resize, selectable_text, tooltip,
 };
@@ -53,6 +53,9 @@ pub enum Message {
     MarkAsRead,
     ContentResized(Size),
     PendingScrollTo,
+    ReplyTo(ReplyTarget),
+    MessageHovered(message::Hash),
+    MessageUnhovered(message::Hash),
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +71,7 @@ pub enum Event {
     ImagePreview(PathBuf, url::Url),
     ExpandCondensedMessage(DateTime<Utc>, message::Hash),
     ContractCondensedMessage(DateTime<Utc>, message::Hash),
+    ReplyTo(ReplyTarget),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +155,7 @@ pub fn view<'a>(
     history: &'a history::Manager,
     previews: Option<Previews<'a>>,
     visible_for_source: Option<impl Fn(&Preview, &message::Source) -> bool>,
+    reply_enabled: bool,
     chathistory_state: Option<ChatHistoryState>,
     config: &'a Config,
     theme: &'a Theme,
@@ -235,6 +240,12 @@ pub fn view<'a>(
     let range_timestamp_excess_width = range_timestamp_extra_chars
         .map(|len| font::width_from_chars(len, &config.font));
 
+    let reply_lookup: HashMap<&str, &'a data::Message> = old_messages
+        .iter()
+        .chain(&new_messages)
+        .filter_map(|message| message.id.as_deref().map(|id| (id, *message)))
+        .collect();
+
     let message_rows = |last_date: Option<NaiveDate>,
                         messages: &[&'a data::Message]| {
         messages
@@ -266,6 +277,30 @@ pub fn view<'a>(
                         hide_nickname,
                     )
                     .map(|element| {
+                        let mut element = add_reply_indicator(
+                            message,
+                            element,
+                            message
+                                .reply_to
+                                .as_deref()
+                                .and_then(|id| reply_lookup.get(id).copied()),
+                            config,
+                            theme,
+                        );
+
+                        if reply_enabled
+                            && state.hovered_message == Some(message.hash)
+                        {
+                            if let Some(target) = ReplyTarget::from_message(message) {
+                                element = add_reply_button(element, target, theme);
+                            }
+                        }
+
+                        let element: Element<'a, Message> = mouse_area(element)
+                            .on_enter(Message::MessageHovered(message.hash))
+                            .on_exit(Message::MessageUnhovered(message.hash))
+                            .into();
+
                         (message, keyed(keyed::Key::message(message), element))
                     }))
             })
@@ -486,6 +521,72 @@ pub fn view<'a>(
     )
 }
 
+fn add_reply_indicator<'a>(
+    message: &data::Message,
+    element: Element<'a, Message>,
+    parent: Option<&'a data::Message>,
+    _config: &Config,
+    theme: &Theme,
+) -> Element<'a, Message> {
+    if message.reply_to.is_none() {
+        return element;
+    }
+
+    let (author, snippet) = parent
+        .map(|parent| {
+            (super::message_author(parent), super::reply_snippet(parent))
+        })
+        .unwrap_or((None, String::new()));
+
+    let text_value = if let Some(author) = author {
+        if snippet.is_empty() {
+            author
+        } else {
+            format!("{author}: {snippet}")
+        }
+    } else if !snippet.is_empty() {
+        snippet
+    } else {
+        String::from("Replying to an earlier message")
+    };
+
+    let indicator = row![
+        text("↪")
+            .size(theme::TEXT_SIZE - 2.0)
+            .style(theme::text::tertiary),
+        selectable_text(text_value)
+            .style(theme::selectable_text::tertiary)
+            .font_maybe(theme::font_style::tertiary(theme).map(font::get)),
+    ]
+    .spacing(6);
+
+    column![indicator, element].spacing(4).into()
+}
+
+fn add_reply_button<'a>(
+    element: Element<'a, Message>,
+    target: ReplyTarget,
+    theme: &Theme,
+) -> Element<'a, Message> {
+    let content = container(
+        text("↩ Reply")
+            .size(theme::TEXT_SIZE - 2.0)
+            .style(theme::text::tertiary)
+            .font_maybe(theme::font_style::tertiary(theme).map(font::get)),
+    )
+    .padding([2, 6]);
+
+    let button = crate::widget::button::transparent_button(
+        content,
+        Message::ReplyTo(target),
+    );
+
+    row![element, button]
+        .spacing(6)
+        .align_y(alignment::Vertical::Top)
+        .into()
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub scrollable: widget::Id,
@@ -496,6 +597,7 @@ pub struct State {
     pending_scroll_to: Option<keyed::Key>,
     visible_url_messages: HashMap<message::Hash, Vec<url::Url>>,
     hovered_preview: Option<(message::Hash, usize)>,
+    hovered_message: Option<message::Hash>,
 }
 
 impl State {
@@ -511,6 +613,7 @@ impl State {
             pending_scroll_to: None,
             visible_url_messages: HashMap::new(),
             hovered_preview: None,
+            hovered_message: None,
         }
     }
 
@@ -852,6 +955,17 @@ impl State {
 
                     self.pending_scroll_to = None;
                     return (scroll_to, None);
+                }
+            }
+            Message::ReplyTo(target) => {
+                return (Task::none(), Some(Event::ReplyTo(target)));
+            }
+            Message::MessageHovered(hash) => {
+                self.hovered_message = Some(hash);
+            }
+            Message::MessageUnhovered(hash) => {
+                if self.hovered_message == Some(hash) {
+                    self.hovered_message = None;
                 }
             }
         }

@@ -201,6 +201,7 @@ pub struct Message {
     pub target: Target,
     pub content: Content,
     pub id: Option<String>,
+    pub reply_to: Option<String>,
     pub hash: Hash,
     pub hidden_urls: HashSet<Url>,
     pub is_echo: bool, // Only relevant if direction == Direction::Received
@@ -307,6 +308,7 @@ impl Message {
     ) -> Option<Message> {
         let server_time = server_time(&encoded);
         let id = message_id(&encoded);
+        let reply_to = message_reply_parent(&encoded);
         let is_echo = encoded
             .user(casemapping)
             .is_some_and(|user| user.nickname() == our_nick);
@@ -340,6 +342,7 @@ impl Message {
             target,
             content,
             id,
+            reply_to,
             hash,
             hidden_urls: HashSet::default(),
             is_echo,
@@ -364,6 +367,7 @@ impl Message {
     ) -> Option<(Message, Option<Highlight>)> {
         let server_time = server_time(&encoded);
         let id = message_id(&encoded);
+        let reply_to = message_reply_parent(&encoded);
         let is_echo = encoded
             .user(casemapping)
             .is_some_and(|user| user.nickname() == our_nick);
@@ -397,6 +401,7 @@ impl Message {
             target,
             content,
             id,
+            reply_to,
             hash,
             hidden_urls: HashSet::default(),
             is_echo,
@@ -451,6 +456,7 @@ impl Message {
         target: Target,
         content: Content,
         command: Option<command::Irc>,
+        reply_to: Option<String>,
     ) -> Self {
         let received_at = Posix::now();
         let server_time = Utc::now();
@@ -463,6 +469,7 @@ impl Message {
             target,
             content,
             id: None,
+            reply_to,
             hash,
             hidden_urls: HashSet::default(),
             is_echo: false,
@@ -496,6 +503,7 @@ impl Message {
             },
             content,
             id: None,
+            reply_to: None,
             hash,
             hidden_urls: HashSet::default(),
             is_echo: false,
@@ -527,6 +535,7 @@ impl Message {
             },
             content,
             id: None,
+            reply_to: None,
             hash,
             hidden_urls: HashSet::default(),
             is_echo: false,
@@ -569,6 +578,7 @@ impl Message {
             target,
             content,
             id: None,
+            reply_to: None,
             hash,
             hidden_urls: HashSet::default(),
             is_echo: false,
@@ -615,6 +625,7 @@ impl Serialize for Message {
             target: &'a Target,
             content: &'a Content,
             id: &'a Option<String>,
+            reply_to: &'a Option<String>,
             // Old field before we had fragments,
             // added for downgrade compatibility
             text: Cow<'a, str>,
@@ -630,6 +641,7 @@ impl Serialize for Message {
             target: &self.target,
             content: &self.content,
             id: &self.id,
+            reply_to: &self.reply_to,
             text: self.content.text(),
             hidden_urls: &self.hidden_urls,
             is_echo: &self.is_echo,
@@ -656,6 +668,8 @@ impl<'de> Deserialize<'de> for Message {
             // Old field before we had fragments
             text: Option<String>,
             id: Option<String>,
+            #[serde(default, deserialize_with = "fail_as_none")]
+            reply_to: Option<String>,
             #[serde(default)]
             hidden_urls: HashSet<url::Url>,
             // New field, optional for upgrade compatibility
@@ -673,6 +687,7 @@ impl<'de> Deserialize<'de> for Message {
             content,
             text,
             id,
+            reply_to,
             hidden_urls,
             is_echo,
             command,
@@ -699,6 +714,7 @@ impl<'de> Deserialize<'de> for Message {
             target,
             content,
             id,
+            reply_to,
             hash,
             hidden_urls,
             is_echo,
@@ -889,6 +905,7 @@ pub fn condense(
             target,
             content: Content::Fragments(condensed_fragments),
             id: None,
+            reply_to: None,
             hash: first_message.hash,
             hidden_urls: HashSet::default(),
             is_echo: false,
@@ -2173,6 +2190,10 @@ fn target(
 
 pub fn message_id(message: &Encoded) -> Option<String> {
     message.tags.get("msgid").cloned()
+}
+
+pub fn message_reply_parent(message: &Encoded) -> Option<String> {
+    message.tags.get("+draft/reply").cloned()
 }
 
 pub fn server_time(message: &Encoded) -> DateTime<Utc> {

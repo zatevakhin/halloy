@@ -18,9 +18,11 @@ use iced::widget::{
     self, button, column, container, operation, row, rule, text, text_editor,
 };
 use iced::{Alignment, Length, Task, clipboard, event, keyboard, padding};
+use irc::proto;
 use tokio::time;
 
 use self::completion::Completion;
+use crate::buffer::ReplyTarget;
 use crate::widget::key_press::is_numpad;
 use crate::widget::{
     Element, Renderer, Text, anchored_overlay, context_menu, decorate,
@@ -69,6 +71,7 @@ pub enum Message {
     CopyAll,
     Copy,
     Cut,
+    ClearReply,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -496,17 +499,71 @@ pub fn view<'a>(
     let maybe_vertical_rule =
         maybe_our_user.is_some().then(move || rule::vertical(1.0));
 
-    let content = column![
-        container(
-            row![maybe_our_user, maybe_vertical_rule, wrapped_input]
-                .spacing(4)
-                .height(Length::Shrink)
-                .align_y(Alignment::Center)
-        )
-        .max_height((7.55 * theme::line_height(&config.font).ceil()).ceil())
-        .padding(8)
-        .style(theme::container::buffer_text_input)
-    ]
+    let reply_banner: Option<Element<'a, Message>> =
+        state.reply_target.as_ref().map(|target| {
+            let label = target
+                .nickname
+                .as_deref()
+                .filter(|label| !label.is_empty())
+                .unwrap_or("message");
+            let snippet = target
+                .snippet
+                .as_str()
+                .trim()
+                .chars()
+                .take(120)
+                .collect::<String>();
+            let reply_text = if snippet.is_empty() {
+                format!("Replying to {label}")
+            } else {
+                format!("Replying to {label}: {snippet}")
+            };
+
+            container(
+                row![
+                    text(reply_text)
+                        .width(Length::Fill)
+                        .style(theme::text::secondary)
+                        .font_maybe(
+                            theme::font_style::secondary(theme).map(font::get),
+                        ),
+                    button(
+                        text("Cancel")
+                            .style(theme::text::secondary)
+                            .font_maybe(
+                                theme::font_style::secondary(theme)
+                                    .map(font::get),
+                            ),
+                    )
+                    .padding([2, 8])
+                    .style(|theme, status| {
+                        theme::button::secondary(theme, status, false)
+                    })
+                    .on_press(Message::ClearReply),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding([4, 8])
+            .style(theme::container::buffer_text_input)
+            .into()
+        });
+
+    let input_container = container(
+        row![maybe_our_user, maybe_vertical_rule, wrapped_input]
+            .spacing(4)
+            .height(Length::Shrink)
+            .align_y(Alignment::Center),
+    )
+    .max_height((7.55 * theme::line_height(&config.font).ceil()).ceil())
+    .padding(8)
+    .style(theme::container::buffer_text_input);
+
+    let content = if let Some(banner) = reply_banner {
+        column![banner, input_container]
+    } else {
+        column![input_container]
+    }
     .spacing(4)
     .padding(padding::top(4));
 
@@ -548,6 +605,7 @@ pub struct State {
     error: Option<String>,
     completion: Completion,
     selected_history: Option<usize>,
+    reply_target: Option<ReplyTarget>,
 }
 
 impl Default for State {
@@ -567,6 +625,7 @@ impl State {
             error: None,
             completion: Completion::default(),
             selected_history: None,
+            reply_target: None,
         }
     }
 
@@ -905,17 +964,36 @@ impl State {
                     history.record_input_history(buffer, raw_input.to_owned());
                     self.input_content = text_editor::Content::new();
 
-                    if let Some(encoded) = input.encoded() {
+                    let reply_context = self.reply_target.clone();
+                    let mut cleared_reply = false;
+
+                    if let Some(mut encoded) = input.encoded() {
                         let sent_time = server_time(&encoded);
 
+                        let is_privmsg = matches!(
+                            encoded.command,
+                            proto::Command::PRIVMSG(_, _)
+                        );
+
+                        if is_privmsg
+                            && clients.get_server_supports_message_tags(
+                                buffer.server(),
+                            )
+                            && let Some(reply) = reply_context.as_ref()
+                        {
+                            encoded.tags.insert(
+                                "+draft/reply".into(),
+                                reply.msgid.clone(),
+                            );
+                        }
+
                         clients.send(buffer, encoded, TokenPriority::User);
+                        cleared_reply = is_privmsg;
 
                         let supports_echoes =
                             clients.get_server_supports_echoes(buffer.server());
 
                         if config.buffer.mark_as_read.on_message_sent
-                            // If the server supports echoes, then send MARKREAD
-                            // on echo only (not when recording the input)
                             && !supports_echoes
                         {
                             let chantypes =
@@ -969,7 +1047,7 @@ impl State {
 
                         let mut history_tasks = vec![];
 
-                        if let Some(messages) = input.messages(
+                        if let Some(mut messages) = input.messages(
                             user,
                             channel_users,
                             buffer.server(),
@@ -979,6 +1057,15 @@ impl State {
                             supports_echoes,
                             config,
                         ) {
+                            if let Some(reply) = reply_context.as_ref()
+                                && cleared_reply
+                            {
+                                for message in &mut messages {
+                                    message.reply_to =
+                                        Some(reply.msgid.clone());
+                                }
+                            }
+
                             for message in messages {
                                 history_tasks.extend(
                                     history
@@ -996,6 +1083,10 @@ impl State {
                         history_task = Task::batch(
                             history_tasks.into_iter().map(Task::future),
                         );
+                    }
+
+                    if cleared_reply {
+                        self.reply_target = None;
                     }
 
                     (Task::none(), Some(Event::InputSent { history_task }))
@@ -1118,7 +1209,10 @@ impl State {
             }
             // Capture escape so that closing context menu or commands/emojis picker
             // does not defocus input
-            Message::Escape => (Task::none(), None),
+            Message::Escape => {
+                self.clear_reply();
+                (Task::none(), None)
+            }
             Message::SendCommand { buffer, command } => {
                 let input =
                     data::Input::command(buffer.clone(), command).encoded();
@@ -1169,6 +1263,10 @@ impl State {
                 let task = clipboard::write(input.to_string());
 
                 Self::close_context_menu(main_window.id, vec![task])
+            }
+            Message::ClearReply => {
+                self.clear_reply();
+                (Task::none(), None)
             }
             Message::SelectAll => {
                 self.input_content.perform(text_editor::Action::SelectAll);
@@ -1438,6 +1536,14 @@ impl State {
         self.error = None;
         self.completion = Completion::default();
         self.selected_history = None;
+    }
+
+    pub fn start_reply(&mut self, target: ReplyTarget) {
+        self.reply_target = Some(target);
+    }
+
+    pub fn clear_reply(&mut self) {
+        self.reply_target = None;
     }
 
     pub fn insert_user(

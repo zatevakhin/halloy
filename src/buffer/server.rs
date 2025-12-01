@@ -53,6 +53,7 @@ pub fn view<'a>(
             history,
             None,
             Option::<fn(&Preview, &message::Source) -> bool>::None,
+            false,
             None,
             config,
             theme,
@@ -248,6 +249,7 @@ impl Server {
                     ) => {
                         Some(Event::ContractCondensedMessage(server_time, hash))
                     }
+                    scroll_view::Event::ReplyTo(_) => None,
                 });
 
                 (command.map(Message::ScrollView), event)

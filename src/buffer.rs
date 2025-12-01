@@ -69,6 +69,61 @@ pub enum Event {
     ContractCondensedMessage(DateTime<Utc>, message::Hash),
 }
 
+#[derive(Debug, Clone)]
+pub struct ReplyTarget {
+    pub msgid: String,
+    pub message_hash: message::Hash,
+    pub nickname: Option<String>,
+    pub snippet: String,
+}
+
+impl ReplyTarget {
+    pub fn from_message(message: &data::Message) -> Option<Self> {
+        let msgid = message.id.clone()?;
+        if !message.can_reference() {
+            return None;
+        }
+        Some(Self {
+            msgid,
+            message_hash: message.hash,
+            nickname: message_author(message),
+            snippet: reply_snippet(message),
+        })
+    }
+}
+
+fn message_author(message: &data::Message) -> Option<String> {
+    match message.target.source() {
+        message::Source::User(user) => Some(user.nickname().to_string()),
+        message::Source::Action(Some(user)) => {
+            Some(user.nickname().to_string())
+        }
+        _ => None,
+    }
+}
+
+fn reply_snippet(message: &data::Message) -> String {
+    const LIMIT: usize = 140;
+
+    let trimmed = message.text().trim().to_string();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut snippet = String::new();
+    let mut chars = trimmed.chars();
+    for _ in 0..LIMIT {
+        if let Some(ch) = chars.next() {
+            snippet.push(ch);
+        } else {
+            return snippet;
+        }
+    }
+
+    snippet.push('…');
+    snippet
+}
+
 impl Buffer {
     pub fn from_data(
         buffer: data::Buffer,
