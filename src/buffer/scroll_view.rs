@@ -56,6 +56,7 @@ pub enum Message {
     ReplyTo(ReplyTarget),
     MessageHovered(message::Hash),
     MessageUnhovered(message::Hash),
+    ToggleReplies(message::Hash),
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +296,7 @@ pub fn view<'a>(
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
     let mut last_date: Option<NaiveDate> = None;
     let mut prev_message: Option<&data::Message> = None;
+    let mut skip_depth: Option<usize> = None;
 
     let show_backlog_divider = !old_messages.is_empty()
         && !new_messages.is_empty()
@@ -303,6 +305,14 @@ pub fn view<'a>(
     let mut divider_inserted = !show_backlog_divider;
 
     for (message, depth) in flattened {
+        if let Some(limit) = skip_depth {
+            if depth > limit {
+                continue;
+            } else {
+                skip_depth = None;
+            }
+        }
+
         let hide_nickname = if let HideConsecutive::Enabled(duration) =
             config.buffer.nickname.hide_consecutive
         {
@@ -351,7 +361,53 @@ pub fn view<'a>(
             .into();
         }
 
-        if reply_enabled && state.hovered_message == Some(message.hash) {
+        let has_children = children
+            .get(&message.hash)
+            .map_or(false, |kids| !kids.is_empty());
+        let child_count = children
+            .get(&message.hash)
+            .map(|kids| kids.len())
+            .unwrap_or(0);
+        let is_expanded = state.expanded_threads.contains(&message.hash);
+        let is_collapsed = has_children && !is_expanded;
+
+        if has_children {
+            let chevron = if is_collapsed { "▶" } else { "▼" };
+            let replies_label = if child_count == 1 {
+                "1 reply".to_string()
+            } else {
+                format!("{child_count} replies")
+            };
+
+            let toggle = crate::widget::button::transparent_button(
+                row![
+                    text(chevron)
+                        .size(theme::TEXT_SIZE - 2.0)
+                        .style(theme::text::tertiary),
+                    text(replies_label)
+                        .style(theme::text::tertiary)
+                        .font_maybe(
+                            theme::font_style::tertiary(theme).map(font::get)
+                        )
+                ]
+                .spacing(4),
+                Message::ToggleReplies(message.hash),
+            );
+
+            let reply_button = if reply_enabled
+                && state.hovered_message == Some(message.hash)
+                && let Some(target) = ReplyTarget::from_message(message)
+            {
+                add_reply_button(toggle, target, theme)
+            } else {
+                toggle
+            };
+
+            element = row![element, reply_button]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into();
+        } else if reply_enabled && state.hovered_message == Some(message.hash) {
             if let Some(target) = ReplyTarget::from_message(message) {
                 element = add_reply_button(element, target, theme);
             }
@@ -514,6 +570,10 @@ pub fn view<'a>(
         }
 
         rows.push(element);
+
+        if is_collapsed {
+            skip_depth = Some(depth);
+        }
     }
     let content = on_resize(
         column![
@@ -582,6 +642,7 @@ pub struct State {
     visible_url_messages: HashMap<message::Hash, Vec<url::Url>>,
     hovered_preview: Option<(message::Hash, usize)>,
     hovered_message: Option<message::Hash>,
+    expanded_threads: HashSet<message::Hash>,
 }
 
 impl State {
@@ -598,6 +659,7 @@ impl State {
             visible_url_messages: HashMap::new(),
             hovered_preview: None,
             hovered_message: None,
+            expanded_threads: HashSet::new(),
         }
     }
 
@@ -950,6 +1012,11 @@ impl State {
             Message::MessageUnhovered(hash) => {
                 if self.hovered_message == Some(hash) {
                     self.hovered_message = None;
+                }
+            }
+            Message::ToggleReplies(hash) => {
+                if !self.expanded_threads.insert(hash) {
+                    self.expanded_threads.remove(&hash);
                 }
             }
         }
