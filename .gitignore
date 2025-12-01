@@ -19,6 +19,9 @@
 .vscode/
 .helix/
 
+# Direnv
+.direnv
+
 # Flatpak generated files
 /assets/flatpak/generated-sources.json
 .flatpak-builder
